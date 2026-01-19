@@ -17,7 +17,7 @@ import numpy as np
 from dataclasses import dataclass, field
 import numpy as np
 import time
-from poses import WarriorIIPose, RaisedArmPose, PoseSmoother, CobraPose, SmallCobraPose
+from poses import WarriorIIPose, RaisedArmPose, BayesianPoseRefiner, CobraPose, SmallCobraPose, AdaptiveBayesianRefiner
 from voice_control import VoiceCommandCenter
 
 # --- Drawing Constants ---
@@ -48,6 +48,73 @@ def draw_skeleton(image, landmarks, width, height, color=(0, 255, 0), thickness=
         cx, cy = int(lm.x * width), int(lm.y * height)
         cv2.circle(image, (cx, cy), 4, (255, 255, 255), -1)
 
+
+def _draw_skeleton_with_uncertainty(image, landmarks, sigmas, width, height, color=(0, 255, 0), thickness=2):
+    """
+    Draws the skeleton and adds a shaded 'uncertainty cloud' around each joint.
+    """
+    # Create an overlay layer for transparency
+    overlay = image.copy()
+    
+    # 1. Draw Uncertainty Clouds
+    for i, (lm, sig) in enumerate(zip(landmarks, sigmas)):
+        cx, cy = int(lm.x * width), int(lm.y * height)
+        
+        # Calculate radius based on sigma (average of x and y uncertainty)
+        # We multiply by a scaling factor (e.g., 1500) to make it visible
+        uncertainty_radius = int(np.mean(sig) * 1500)
+        
+        if uncertainty_radius > 2:
+            # Draw a soft 'cloud' representing the noise/variance
+            cv2.circle(overlay, (cx, cy), uncertainty_radius, (200, 200, 200), -1)
+
+    # Blend the overlay with the original image (alpha = 0.4)
+    cv2.addWeighted(overlay, 0.4, image, 0.6, 0, image)
+
+    # 2. Draw standard skeleton lines on top
+    for connection in POSE_CONNECTIONS:
+        start_lm, end_lm = landmarks[connection[0]], landmarks[connection[1]]
+        start_p = (int(start_lm.x * width), int(start_lm.y * height))
+        end_p = (int(end_lm.x * width), int(end_lm.y * height))
+        cv2.line(image, start_p, end_p, color, thickness)
+
+    # 3. Draw joint points
+    for lm in landmarks:
+        cv2.circle(image, (int(lm.x * width), int(lm.y * height)), thickness+1, (255, 255, 255), -1)
+
+def draw_skeleton_with_uncertainty(image, landmarks, sigmas, width, height, color=(0, 255, 0), thickness=2):
+    """
+    Draws the skeleton and adds a shaded 'uncertainty cloud' around each joint.
+    """
+    # Create an overlay for transparency
+    overlay = image.copy()
+    
+    # 1. Draw Uncertainty Clouds
+    for i, (lm, sig) in enumerate(zip(landmarks, sigmas)):
+        cx, cy = int(lm.x * width), int(lm.y * height)
+        
+        # Calculate radius based on the average uncertainty of x and y
+        # Multiply by a scaling factor (e.g., 2000) to make it visible in pixel space
+        uncertainty_radius = int(np.mean(sig) * 2000)
+        
+        if uncertainty_radius > 2:
+            # Draw a soft 'cloud' representing the noise/variance
+            # We use white (255, 255, 255) for the glow
+            cv2.circle(overlay, (cx, cy), uncertainty_radius, (220, 220, 220), -1)
+
+    # Blend the overlay with the original image (0.3 alpha for the cloud)
+    cv2.addWeighted(overlay, 0.3, image, 0.7, 0, image)
+
+    # 2. Draw standard skeleton lines on top
+    for connection in POSE_CONNECTIONS:
+        start_p = (int(landmarks[connection[0]].x * width), int(landmarks[connection[0]].y * height))
+        end_p = (int(landmarks[connection[1]].x * width), int(landmarks[connection[1]].y * height))
+        cv2.line(image, start_p, end_p, color, thickness)
+
+    # 3. Draw joint points
+    for lm in landmarks:
+        cv2.circle(image, (int(lm.x * width), int(lm.y * height)), thickness + 1, (255, 255, 255), -1)
+
 # --- 2. Pose Definitions ---
 
 POSE_CLASSES = {
@@ -64,10 +131,6 @@ voice_center = VoiceCommandCenter(POSE_CLASSES)
 voice_thread = threading.Thread(target=voice_center.listen_loop, daemon=True)
 voice_thread.start()
 
-
-
-# Initialize your dataclass-based coach
-warrior_coach = RaisedArmPose()
 
 # 1. Setup Configuration
 model_path = 'pose_landmarker_lite.task' # Ensure this file is in your directory
@@ -93,8 +156,8 @@ def calculate_angle(a, b, c):
 
 cap = cv2.VideoCapture(0)
 start_time = time.time() # Record the start time
-pose_smoother = PoseSmoother(alpha=0.6) # Tweak this for your Mac/Jetson latency
-
+refiner = BayesianPoseRefiner(process_noise=0.005)
+refiner = AdaptiveBayesianRefiner()
 
 with PoseLandmarker.create_from_options(options) as landmarker:
     while cap.isOpened():
@@ -115,14 +178,20 @@ with PoseLandmarker.create_from_options(options) as landmarker:
         current_coach = voice_center.active_pose_instance
         
         if result.pose_landmarks:
-            landmarks = result.pose_landmarks[0]
-            # landmarks = pose_smoother.smooth(raw_landmarks)
+            raw_landmarks = result.pose_landmarks[0]
+            landmarks, sigmas = refiner.refine(raw_landmarks)
 
+            # Calculate global noise level
+            global_noise = np.mean(sigmas)
             is_perfect, coach_msg = current_coach.evaluate(landmarks)
             color = (0, 255, 0) if is_perfect else (0, 0, 255)
             thickness = 8 if is_perfect else 2
 
-            draw_skeleton(frame, landmarks, w, h, color=color, thickness=thickness)
+            # draw_skeleton(frame, landmarks, w, h, color=color, thickness=thickness)
+            draw_skeleton_with_uncertainty(
+                frame, landmarks, sigmas, w, h, 
+                color=color, thickness=thickness
+            )
             # UI Feedbacks
             cv2.putText(frame, f"Active Pose: {current_coach.__class__.__name__}", (15, 40), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)

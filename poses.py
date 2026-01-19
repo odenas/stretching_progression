@@ -291,3 +291,102 @@ class PoseSmoother:
         
         self.previous_landmarks = smoothed_landmarks
         return smoothed_landmarks
+    
+
+
+import numpy as np
+# Helper class for downstream compatibility
+class Point:
+    def __init__(self, x, y): self.x, self.y = x, y
+
+
+class BayesianPoseRefiner:
+    def __init__(self, num_landmarks=33, process_noise=0.005):
+        # Initialize state as NumPy arrays for vectorized math
+        self.mu = np.zeros((num_landmarks, 2))      # [x, y] coordinates
+        self.sigma = np.ones((num_landmarks, 2))    # Uncertainty
+        self.Q = process_noise                      # Prediction noise
+        self.initialized = False
+
+    def refine(self, landmarks_list):
+        """
+        landmarks_list: The raw list of landmark objects from MediaPipe
+        """
+        # 1. Convert MediaPipe landmarks to NumPy arrays
+        # Shape: (33, 2) for coordinates, (33, 1) for confidence
+        coords = np.array([[lm.x, lm.y] for lm in landmarks_list])
+        
+        # Extract presence/visibility scores as our 'Confidence'
+        # We use a default of 0.5 if the attribute is missing
+        conf = np.array([[getattr(lm, 'presence', 0.5)] for lm in landmarks_list])
+        
+        # 2. Prediction Step (Prior)
+        self.sigma += self.Q
+
+        # 3. Measurement Uncertainty (Likelihood)
+        # R is high when confidence is low
+        R = 1.0 - conf + 1e-6
+
+        # 4. Bayesian Update (The Kalman Gain)
+        # K = Prior_Uncertainty / (Prior_Uncertainty + Measurement_Uncertainty)
+        K = self.sigma / (self.sigma + R)
+
+        if not self.initialized:
+            self.mu = coords
+            self.initialized = True
+        else:
+            # Posterior Mean = Prior Mean + Gain * (Measurement - Prior Mean)
+            self.mu = self.mu + K * (coords - self.mu)
+
+        # 5. Update Uncertainty (Posterior)
+        self.sigma = (1 - K) * self.sigma
+        
+        refined_points = [Point(p[0], p[1]) for p in self.mu]
+        return refined_points, self.sigma.copy()
+    
+
+
+
+
+import numpy as np
+
+class AdaptiveBayesianRefiner:
+    def __init__(self, num_landmarks=33, q_base=0.001, k_velocity=0.05):
+        self.mu = np.zeros((num_landmarks, 2))      
+        self.sigma = np.ones((num_landmarks, 2))    
+        self.q_base = q_base                        # Noise when still
+        self.k = k_velocity                         # How much movement boosts Q
+        self.initialized = False
+
+    def refine(self, landmarks_list):
+        coords = np.array([[lm.x, lm.y] for lm in landmarks_list])
+        conf = np.array([[getattr(lm, 'presence', 0.5)] for lm in landmarks_list])
+        
+        if not self.initialized:
+            self.mu = coords
+            self.initialized = True
+            return [Point(p[0], p[1]) for p in self.mu], self.sigma
+
+        # 1. Calculate Velocity (Distance moved since last refined state)
+        # We use the Euclidean distance for each landmark
+        velocity = np.linalg.norm(coords - self.mu, axis=1, keepdims=True)
+
+        # 2. Adaptive Q: More velocity = More Process Noise
+        # This makes the filter 'looser' during fast moves
+        Q_adaptive = self.q_base + (self.k * (velocity**2))
+
+        # 3. Prediction Step (Prior)
+        self.sigma += Q_adaptive
+
+        # 4. Measurement Uncertainty (Likelihood)
+        R = 1.0 - conf + 1e-6
+
+        # 5. Bayesian Update (Kalman Gain)
+        K = self.sigma / (self.sigma + R)
+
+        # 6. Update Mean and Sigma
+        self.mu = self.mu + K * (coords - self.mu)
+        self.sigma = (1 - K) * self.sigma
+
+                
+        return [Point(p[0], p[1]) for p in self.mu], self.sigma
